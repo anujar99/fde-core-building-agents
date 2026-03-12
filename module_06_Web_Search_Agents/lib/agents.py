@@ -13,6 +13,8 @@ class AgentState(TypedDict):
     instructions: str  # System instructions for the agent
     messages: List[dict]  # List of conversation messages
     current_tool_calls: Optional[List[ToolCall]]  # Current pending tool calls
+    web_search_result: Optional[str]  # Raw result from web search
+    comparison: Optional[str]  # Comparison between internal knowledge and web search
     
 class Agent:
     def __init__(self, 
@@ -102,6 +104,43 @@ class Agent:
             "current_tool_calls": None,
             "session_id": state["session_id"]
         }
+    
+    def _web_search_step(self, state: AgentState) -> AgentState:
+        """Step logic: Run web search for the user query using the web_search tool"""
+        web_search_tool = next((t for t in self.tools if t.name == "web_search"), None)
+
+        if web_search_tool is None:
+            return {"web_search_result": None}
+
+        result = web_search_tool(query=state["user_query"])
+        return {"web_search_result": str(result)}
+
+    def _comparison_step(self, state: AgentState) -> AgentState:
+        """Step logic: Compare the LLM's internal answer with the web search result"""
+        web_result = state.get("web_search_result")
+
+        if not web_result:
+            return {"comparison": None}
+
+        # Get the last assistant message (internal knowledge answer)
+        internal_answer = next(
+            (m.content for m in reversed(state["messages"]) if m.role == "assistant" and m.content),
+            "No internal answer available"
+        )
+
+        llm = LLM(model=self.model_name, temperature=self.temperature)
+        comparison_messages = [
+            SystemMessage(content="You are a helpful assistant that compares information sources objectively."),
+            UserMessage(content=(
+                f'Compare these two answers to the question: "{state["user_query"]}"\n\n'
+                f"**Internal knowledge answer:**\n{internal_answer}\n\n"
+                f"**Web search result:**\n{web_result}\n\n"
+                "Briefly highlight: 1) similarities, 2) key differences, 3) which source is more accurate or current."
+            ))
+        ]
+
+        response = llm.invoke(comparison_messages)
+        return {"comparison": response.content}
 
     def _create_state_machine(self) -> StateMachine[AgentState]:
         """Create the internal state machine for the agent"""
@@ -114,21 +153,26 @@ class Agent:
         tool_executor = Step[AgentState]("tool_executor", self._tool_step)
         termination = Termination[AgentState]()
         
-        machine.add_steps([entry, message_prep, llm_processor, tool_executor, termination])
-        
+        web_searcher = Step[AgentState]("web_searcher", self._web_search_step)
+        comparator = Step[AgentState]("comparator", self._comparison_step)
+
+        machine.add_steps([entry, message_prep, llm_processor, tool_executor, web_searcher, comparator, termination])
+
         # Add transitions
         machine.connect(entry, message_prep)
         machine.connect(message_prep, llm_processor)
-        
+
         # Transition based on whether there are tool calls
         def check_tool_calls(state: AgentState) -> Union[Step[AgentState], str]:
             """Transition logic: Check if there are tool calls"""
             if state.get("current_tool_calls"):
                 return tool_executor
-            return termination
-        
-        machine.connect(llm_processor, [tool_executor, termination], check_tool_calls)
+            return web_searcher
+
+        machine.connect(llm_processor, [tool_executor, web_searcher], check_tool_calls)
         machine.connect(tool_executor, llm_processor)  # Go back to llm after tool execution
+        machine.connect(web_searcher, comparator)
+        machine.connect(comparator, termination)
         
         return machine
 
@@ -161,6 +205,8 @@ class Agent:
             "instructions": self.instructions,
             "messages": previous_messages,
             "current_tool_calls": None,
+            "web_search_result": None,
+            "comparison": None,
             "session_id": session_id,
         }
 
